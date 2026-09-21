@@ -166,6 +166,69 @@ pub async fn of_table(
     Ok(Schema::new(fields))
 }
 
+/// Arrow schema of `sql`'s result set, without executing it.
+///
+/// The query analog of [`of_table`]: wrap `sql` as `DESCRIBE (<sql>)` (query
+/// analysis only, no data scan — see the tracking issue for why this is safe
+/// over HTTP: <https://github.com/ClickHouse/adbc_clickhouse/issues/16>),
+/// run it, and feed the resulting rows through the same `Column` ->
+/// `column_to_arrow` pipeline `of_table` already uses above.
+///
+/// Mind: `sql` is arbitrary query text, not an identifier — `of_table`'s
+/// `{table:Identifier}` parameter style doesn't apply here. Consider what
+/// happens to trailing `;`/whitespace/comments in `sql` once wrapped in
+/// `DESCRIBE (...)`.
+pub async fn of_query(
+    client: &Client, 
+    sql: &str
+) -> adbc_core::error::Result<Schema> {
+    // todo!("DESCRIBE ({sql}) + reuse column_to_arrow, see of_table above")
+    // TODO: haven't thought about trailing whitespace yet
+    let query = client
+        .query_raw(&format!("DESCRIBE ({sql})"));
+
+    // copying the remainder of this code from of_table()
+    // but removing the db and table parts
+    let mut columns = query.fetch::<Column>().map_err(|e| {
+        Error::with_message_and_status(
+            format!("error beginning fetch of subquery schema: {e}"),
+            Status::Internal,
+        )
+    })?;
+
+    // Some type mappings can be affected by dynamic settings,
+    // so we have to query those as well.
+    //
+    // If `get_table_schema()` turns out to be performance-sensitive,
+    // we could issue this query at the same time as the `DESCRIBE TABLE`.
+    // (comment from of_table(), not sure if it still applies to this function)
+    let settings = Settings::query(client).await?;
+
+    let mut fields = Vec::new();
+
+    while let Some(column) = columns.next().await.map_err(|e| {
+        Error::with_message_and_status(
+            format!("error retrieving schema of subquery {sql:?}: {e}"),
+            Status::Internal,
+        )
+    })? {
+        let field = column_to_arrow(&column, &settings).map_err(|e| Error {
+            message:
+                format!(
+                    "error mapping column {:?} of subquery {sql:?}: {}",
+                    column.name, e.message
+                ),
+            ..e
+        })?;
+
+        fields.push(field);
+    }
+
+    Ok(Schema::new(fields))
+
+
+}
+
 fn column_to_arrow(column: &Column, settings: &Settings) -> Result<Field> {
     let ch_type = DataTypeNode::new(&column.r#type).map_err(|e| {
         Error::with_message_and_status(
