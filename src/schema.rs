@@ -182,8 +182,6 @@ pub async fn of_query(
     client: &Client, 
     sql: &str
 ) -> adbc_core::error::Result<Schema> {
-    // todo!("DESCRIBE ({sql}) + reuse column_to_arrow, see of_table above")
-    // TODO: haven't thought about trailing whitespace yet
     let query = client
         .query_raw(&format!("DESCRIBE ({sql})"));
 

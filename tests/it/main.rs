@@ -12,9 +12,11 @@ use std::sync::Arc;
 
 mod bulk_ingest;
 mod database;
+mod diag_corruption;
 mod get_table_schema;
 mod params;
 mod settings;
+mod upstream_get_table_schema_decimal_mismatch;
 
 // NOTE: tests run with the `current-thread` runtime by default.
 // Set `ADBC_CLICKHOUSE_TEST_MULTI_THREAD=1` to test with the `multi-thread` runtime.
