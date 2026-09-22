@@ -12,7 +12,6 @@ use std::sync::Arc;
 
 mod bulk_ingest;
 mod database;
-mod diag_corruption;
 mod get_table_schema;
 mod params;
 mod settings;

@@ -23,8 +23,8 @@ fn get_table_schema_decimal_width_disagrees_with_real_data() {
     let db = driver
         .new_database_with_opts([
             (OptionDatabase::Uri, "http://localhost:8123/".into()),
-            (OptionDatabase::Username, "default".into()),
-            (OptionDatabase::Password, "password".into()),
+            (OptionDatabase::Username, "duckdb_user".into()),
+            (OptionDatabase::Password, "duckdb_password".into()),
         ])
         .unwrap();
     let mut conn = db.new_connection().unwrap();
