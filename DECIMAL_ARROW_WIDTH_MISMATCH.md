@@ -1,7 +1,6 @@
-<!-- delete unnecessary items -->
 ### Describe the bug
 
-For columns `Decimal(P, S)` with `1 <= P <= 18`, `Connection::get_table_schema()` incorrectly reports
+For columns `Decimal(P, S)` with `1 <= P <= 18`, `Connection::get_table_schema()` reports
 `Decimal32`/`Decimal64`, but `Statement::execute()` returns `Decimal128`.
 
 `arrow_decimal()` (`src/schema.rs:379-384`) picks the Arrow decimal width from `Decimal(P, S)`'s
@@ -97,14 +96,6 @@ fn main() {
 | 10-18  | `Decimal64`  | `Decimal128` |
 | 19-38  | `Decimal128` | `Decimal128` |
 | 39-76  | `Decimal256` | `Decimal256` |
-
-### Error log
-
-N/A: output is wrong.
-
-### Query log
-
-N/A
 
 ### Configuration
 
