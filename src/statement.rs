@@ -23,13 +23,28 @@ use clickhouse::query::Query;
 
 use crate::options::OptionValueExt;
 use crate::writer::ArrowStreamWriter;
-use crate::{AugmentedClient, Result, TokioContext, options, random_id};
+use crate::{AugmentedClient, Result, TokioContext, options, random_id, schema};
 use clickhouse::_priv::sql_escape_identifier;
 use clickhouse_ext_arrow::ArrowQueryExt;
 
 #[cfg(doc)]
 use adbc_core::options::IngestMode;
 use uuid::Uuid;
+
+/// ClickHouse serializes HTTP requests within a session and rejects one that arrives
+/// while another holds the session (`SESSION_IS_LOCKED`, code 373). This includes a
+/// follow-up sent just after the previous response, before the server releases the
+/// session. Retry such requests briefly when nothing has been returned to the caller.
+const SESSION_RETRY_LIMIT: u32 = 30;
+
+fn session_locked(message: &str) -> bool {
+    message.contains("SESSION_IS_LOCKED")
+}
+
+fn session_retry_delay(attempt: u32) -> std::time::Duration {
+    // 5, 10, 20, ... ms, capped at 200 ms: about five seconds in total.
+    std::time::Duration::from_millis((5u64 << attempt.min(6)).min(200))
+}
 
 /// ClickHouse ADBC [`Statement`] implementation.
 ///
@@ -257,7 +272,44 @@ impl Statement for ClickhouseStatement {
     /// See the tracking issue for details and subscribe for updates:
     /// <https://github.com/ClickHouse/adbc_clickhouse/issues/16>
     fn execute_schema(&mut self) -> adbc_core::error::Result<Schema> {
-        err_unimplemented!("ClickhouseStatement::execute_schema()")
+        let StatementMode::SqlQuery(sql) = &self.mode else {
+            return Err(Error::with_message_and_status(
+                "execute_schema requires a SQL query",
+                Status::InvalidState,
+            ));
+        };
+        if is_streaming_insert(sql) {
+            return Err(Error::with_message_and_status(
+                "execute_schema requires a query that returns a result set",
+                Status::InvalidState,
+            ));
+        }
+
+        let _guard = self.tokio.enter();
+        let mut attempt = 0;
+        loop {
+            // This statement's query ID is reused for its eventual data query. Give
+            // each metadata request its own ID so ClickHouse does not reject a fast
+            // follow-up request while the previous query is still being cleaned up.
+            let mut schema_client = Client::clone(&self.client);
+            schema_client.set_setting(options::as_setting::QUERY_ID, random_id("schema"));
+            let mut settings_client = schema_client.clone();
+            settings_client
+                .set_setting(options::as_setting::QUERY_ID, random_id("schema_settings"));
+            let mut query = schema_client.query_raw(&format!("DESCRIBE ({sql})"));
+
+            if let Some(BindType::Single(batch)) = &self.bind {
+                query = bind_record_batch(query, batch.clone())?;
+            }
+
+            match self.tokio.block_on(schema::of_query(&settings_client, query)) {
+                Err(e) if attempt < SESSION_RETRY_LIMIT && session_locked(&e.message) => {
+                    std::thread::sleep(session_retry_delay(attempt));
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     /// # Not Implemented
@@ -955,18 +1007,34 @@ fn fetch_blocking(
     // but that results in a larger generated future type
     let _guard = tokio.enter();
 
-    // Raw so a literal `?` is not treated as a bind placeholder;
-    // parameters are bound server-side via `Query::param()`.
-    let mut query = client.query_raw(sql);
-    query = bind_query(query, bind)?;
+    // A streamed bind cannot be replayed, so only scalar or absent binds are retried.
+    let retryable = !matches!(bind, Some(BindType::Stream(_)));
+    let mut bind = bind;
+    let mut attempt = 0;
+    loop {
+        let this_bind = match &bind {
+            Some(BindType::Single(batch)) => Some(BindType::Single(batch.clone())),
+            _ => bind.take(),
+        };
 
-    let cursor = query.fetch_arrow().map_err(|e| {
-        Error::with_message_and_status(format!("error executing query: {e}"), Status::Internal)
-    })?;
+        // Raw so a literal `?` is not treated as a bind placeholder;
+        // parameters are bound server-side via `Query::param()`.
+        let mut query = client.query_raw(sql);
+        query = bind_query(query, this_bind)?;
 
-    tokio
-        .block_on(ArrowStreamReader::begin(tokio.clone(), cursor))
-        .map_err(Into::into)
+        let cursor = query.fetch_arrow().map_err(|e| {
+            Error::with_message_and_status(format!("error executing query: {e}"), Status::Internal)
+        })?;
+
+        // The session error arrives before any data, while reading the schema message.
+        match tokio.block_on(ArrowStreamReader::begin(tokio.clone(), cursor)) {
+            Err(e) if retryable && attempt < SESSION_RETRY_LIMIT && session_locked(&e.to_string()) => {
+                std::thread::sleep(session_retry_delay(attempt));
+                attempt += 1;
+            }
+            result => return result.map_err(Into::into),
+        }
+    }
 }
 
 fn execute_blocking(

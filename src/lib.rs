@@ -101,7 +101,7 @@ use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionDatabase
 use adbc_core::{Connection, Database, Driver, Optionable, schemas};
 use arrow_array::{RecordBatchIterator, RecordBatchReader, record_batch};
 use arrow_schema::Schema;
-use clickhouse::Client;
+use clickhouse::{Client, Compression};
 use rand::distr::{Alphanumeric, SampleString};
 use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
@@ -384,7 +384,8 @@ impl Database for ClickhouseDatabase {
             // Default `product_info` that should always be included
             // Note: we don't apply `self.product_info` at this level in case it's set
             // to a different value at a lower level; `AugmentedClient` covers that.
-            .with_product_info("adbc_clickhouse", env!("CARGO_PKG_VERSION"));
+            .with_product_info("adbc_clickhouse", env!("CARGO_PKG_VERSION"))
+            .with_compression(Compression::None);
 
         if let Some(url) = &self.url {
             client = client.with_url(url.to_string());

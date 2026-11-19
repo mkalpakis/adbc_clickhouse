@@ -1,6 +1,7 @@
 use adbc_core::error::{Error, Status};
 use arrow_schema::{DataType, Field, Fields, Schema, TimeUnit};
 use clickhouse::Client;
+use clickhouse::query::Query;
 use clickhouse_types::DataTypeNode;
 use clickhouse_types::data_types::{DateTimePrecision, DecimalType, EnumType};
 use serde::{Deserialize, Deserializer};
@@ -38,6 +39,10 @@ struct Settings {
     /// <https://clickhouse.com/docs/operations/settings/formats#output_format_arrow_use_64_bit_indexes_for_dictionary>
     #[serde(deserialize_with = "deserialize_bool_setting")]
     use_64_bit_indexes_for_dictionary: bool,
+    /// <https://clickhouse.com/docs/operations/settings/formats#output_format_arrow_date_as_uint16>
+    /// Added in ClickHouse 26.2 (default `0`); older servers always write Date as UInt16.
+    #[serde(deserialize_with = "deserialize_bool_setting_default_true")]
+    date_as_uint16: bool,
 }
 
 impl Default for Settings {
@@ -56,6 +61,7 @@ impl Default for Settings {
             low_cardinality_as_dictionary: false,
             use_signed_indexes_for_dictionary: false,
             use_64_bit_indexes_for_dictionary: false,
+            date_as_uint16: true,
         }
     }
 }
@@ -70,6 +76,7 @@ impl Settings {
             "low_cardinality_as_dictionary",
             "use_signed_indexes_for_dictionary",
             "use_64_bit_indexes_for_dictionary",
+            "date_as_uint16",
         ];
 
         let mut sql = "SELECT ".to_string();
@@ -166,6 +173,43 @@ pub async fn of_table(
     Ok(Schema::new(fields))
 }
 
+/// Describe the result columns of a query prepared as `DESCRIBE (<query>)`.
+pub async fn of_query(client: &Client, query: Query) -> adbc_core::error::Result<Schema> {
+    let mut cursor = query.fetch::<Column>().map_err(|e| {
+        Error::with_message_and_status(
+            format!("error beginning fetch of query schema: {e}"),
+            Status::Internal,
+        )
+    })?;
+
+    let mut columns = Vec::new();
+    while let Some(column) = cursor.next().await.map_err(|e| {
+        Error::with_message_and_status(
+            format!("error retrieving query schema: {e}"),
+            Status::Internal,
+        )
+    })? {
+        columns.push(column);
+    }
+    drop(cursor);
+
+    // Both requests carry the connection's session ID, and ClickHouse rejects a
+    // request that overlaps another on the same session, so finish DESCRIBE first.
+    let settings = Settings::query(client).await?;
+
+    let mut fields = Vec::with_capacity(columns.len());
+    for column in &columns {
+        let field = column_to_arrow(column, &settings).map_err(|e| Error {
+            message: format!("error mapping query column {:?}: {}", column.name, e.message),
+            ..e
+        })?;
+
+        fields.push(field);
+    }
+
+    Ok(Schema::new(fields))
+}
+
 fn column_to_arrow(column: &Column, settings: &Settings) -> Result<Field> {
     let ch_type = DataTypeNode::new(&column.r#type).map_err(|e| {
         Error::with_message_and_status(
@@ -240,7 +284,8 @@ fn ch_type_to_arrow(
         // a canonical extension type in Arrow: https://arrow.apache.org/docs/format/CanonicalExtensions.html#uuid
         // DataTypeNode::UUID => {}
         // https://github.com/ClickHouse/ClickHouse/blob/3196ab525aa6f1fef8d367db7610b765f7737f01/src/Processors/Formats/Impl/CHColumnToArrowColumn.cpp#L86
-        DataTypeNode::Date => Ok(DataType::UInt16),
+        DataTypeNode::Date if settings.date_as_uint16 => Ok(DataType::UInt16),
+        DataTypeNode::Date => Ok(DataType::Date32),
         DataTypeNode::Date32 => Ok(DataType::Date32),
         // https://github.com/ClickHouse/ClickHouse/blob/3196ab525aa6f1fef8d367db7610b765f7737f01/src/Processors/Formats/Impl/CHColumnToArrowColumn.cpp#L87C1-L87C114
         DataTypeNode::DateTime(_) => Ok(DataType::UInt32),
@@ -315,9 +360,11 @@ fn arrow_decimal(scale: &u8, precision: &u8, kind: &DecimalType) -> Result<DataT
     })?;
 
     match kind {
-        DecimalType::Decimal32 => Ok(DataType::Decimal32(*scale, precision)),
-        DecimalType::Decimal64 => Ok(DataType::Decimal64(*scale, precision)),
-        DecimalType::Decimal128 => Ok(DataType::Decimal128(*scale, precision)),
+        // ClickHouse writes Decimal32/64/128 columns as Arrow decimal128, so the
+        // declared schema must match the stream rather than the storage width.
+        DecimalType::Decimal32 | DecimalType::Decimal64 | DecimalType::Decimal128 => {
+            Ok(DataType::Decimal128(*scale, precision))
+        }
         DecimalType::Decimal256 => Ok(DataType::Decimal256(*scale, precision)),
     }
 }
@@ -442,5 +489,20 @@ where
         "0" => Ok(false),
         "1" => Ok(true),
         _ => Err(Error::custom(format!("expected \"0\" or \"1\", got {s:?}"))),
+    }
+}
+
+/// Like [`deserialize_bool_setting`], but a missing setting (older server) means `true`.
+fn deserialize_bool_setting_default_true<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+
+    match Option::<String>::deserialize(deserializer)?.as_deref() {
+        None => Ok(true),
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(s) => Err(Error::custom(format!("expected \"0\" or \"1\", got {s:?}"))),
     }
 }
